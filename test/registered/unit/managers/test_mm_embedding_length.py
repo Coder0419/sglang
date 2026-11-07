@@ -1,3 +1,5 @@
+from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -124,6 +126,65 @@ def test_adjust_embedding_length_rejects_short_embedding():
 
     with pytest.raises(RuntimeError, match="Insufficient multimodal embedding length"):
         mm_utils._adjust_embedding_length(embedding, 3, Mock())
+
+
+def test_scheduler_aborts_embedding_request_when_prompt_is_too_long():
+    """Length rejection must produce a terminal result before queue admission.
+
+    Without the abort state, an embedding request can enter ``waiting_queue``
+    with no schedulable KV-cache admission and repeatedly return ``NO_TOKEN``.
+    """
+    from sglang.srt.managers import scheduler as scheduler_module
+    from sglang.srt.managers.scheduler import Scheduler
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.tokenizer = None
+    scheduler.max_req_input_len = 1536
+    scheduler._maybe_namespace_elastic_radix_cache = Mock()
+    scheduler._record_kv_event_lora_name = Mock()
+    scheduler._add_request_to_queue = Mock()
+
+    req = Mock()
+    recv_req = SimpleNamespace(
+        rid="embedding-over-context",
+        input_text="long embedding prompt",
+        input_ids=[1, 2, 3],
+        sampling_params=Mock(),
+        positional_embed_overrides=None,
+        token_type_ids=None,
+        routed_dp_rank=None,
+        priority=None,
+        dimensions=None,
+        encoding_format=None,
+        lora_id=None,
+        http_worker_ipc=None,
+        time_stats=None,
+        return_pooled_hidden_states=False,
+        multi_item_delimiter_indices=None,
+        token_indices_to_pool=None,
+        decision_layout=None,
+        lora_name=None,
+        mm_inputs=None,
+    )
+
+    with (
+        patch.object(scheduler_module, "Req", return_value=req),
+        patch.object(
+            scheduler_module,
+            "validate_input_length",
+            return_value="input exceeds context length",
+        ),
+        patch.object(
+            scheduler_module,
+            "get_serving",
+            return_value=SimpleNamespace(allow_auto_truncate=False),
+        ),
+        ExitStack() as mm_cleanup,
+    ):
+        scheduler._handle_embedding_request(recv_req, mm_cleanup)
+
+    req.set_finish_with_abort.assert_called_once_with("input exceeds context length")
+    scheduler._add_request_to_queue.assert_called_once_with(req)
 
 
 def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
